@@ -464,11 +464,18 @@ test('stays silent if the reader returns to the top before loading finishes', ()
     );
 });
 
-test('dismisses when the reader reaches the top', () => {
+test('starts fading immediately at the top and removes the prompt after the fade', () => {
     const result = insertAt(500);
     result.finish();
     result.scrollTo(0);
-    vi.advanceTimersByTime(450);
+    const fading = result.render().find((node) => node.type === 'button')!;
+    assert.match(fading.props.className as string, /\bopacity-0\b/);
+    vi.advanceTimersByTime(449);
+    assert.equal(
+        result.render().some((node) => node.type === 'button'),
+        true,
+    );
+    vi.advanceTimersByTime(1);
     assert.equal(
         result.render().some((node) => node.type === 'button'),
         false,
