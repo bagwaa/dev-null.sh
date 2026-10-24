@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import * as React from 'react';
 import type { ReactElement, ReactNode } from 'react';
 import { afterEach, test, vi } from 'vite-plus/test';
-import type { Commit, CursorPaginated } from '../../resources/js/types';
+import type { Commit, CursorPaginated, User } from '../../resources/js/types';
 
 let slots: unknown[];
 let cursor: number;
@@ -70,7 +70,7 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-function insertAt(offset: number, reduced = false) {
+function insertAt(offset: number, reduced = false, authors: User[] = []) {
     slots = [];
     listeners.clear();
     reload.mockClear();
@@ -130,6 +130,10 @@ function insertAt(offset: number, reduced = false) {
                 commits,
                 isRanked: false,
                 newCommitsCount: count,
+                newCommitAuthors: {
+                    users: count > 0 ? authors : [],
+                    total: count > 0 ? authors.length : 0,
+                },
                 suggestions: [],
             }),
         );
@@ -144,9 +148,12 @@ function insertAt(offset: number, reduced = false) {
         }
         for (const effect of layouts) effect();
         for (const effect of effects) effect();
+        return nodes;
     };
-    render(commits(['existing']), 3);
-    vi.advanceTimersByTime(1700);
+    const pending = render(commits(['existing']), 3);
+    vi.advanceTimersByTime(1000);
+    const fetching = render(commits(['existing']), 3);
+    vi.advanceTimersByTime(700);
     const incoming = commits(['one', 'two', 'three', 'existing']);
     listeners.get('beforeUpdate')!({
         detail: {
@@ -162,9 +169,11 @@ function insertAt(offset: number, reduced = false) {
     render(incoming);
     const finish = () => {
         reload.mock.calls.at(-1)![0].onFinish();
-        render(incoming);
+        return render(incoming);
     };
     return {
+        pending,
+        fetching,
         animate,
         top: existing.getBoundingClientRect().top,
         scrollY,
@@ -208,7 +217,14 @@ test('keeps the loaded control while new commits are above a shallowly scrolled 
     assert.equal(vi.getTimerCount(), 0);
 });
 
-for (const total of [1, 5, 6, 104, 10000]) {
+for (const [total, label] of [
+    [1, undefined],
+    [5, undefined],
+    [6, '+1'],
+    [7, '+2'],
+    [104, '+99'],
+    [10000, '99+'],
+] as const) {
     test(`previews five authors and caps the overflow badge for ${total} authors`, () => {
         slots = [];
         cursor = 0;
@@ -244,16 +260,9 @@ for (const total of [1, 5, 6, 104, 10000]) {
         const badge = nodes.find(
             (node) => node.props.title === `${total - 5} more authors`,
         );
-        assert.equal(Boolean(badge), total > 5);
+        assert.equal(Boolean(badge), label !== undefined);
         if (badge) {
-            assert.deepEqual(
-                React.Children.toArray(badge.props.children as ReactNode),
-                [
-                    '+',
-                    Math.min(total - 5, 99),
-                    total - 5 > 99 ? '+' : '',
-                ],
-            );
+            assert.equal(badge.props.children, label);
         }
         reload.mockClear();
         (button.props.onClick as () => void)();
@@ -264,3 +273,25 @@ for (const total of [1, 5, 6, 104, 10000]) {
         ]);
     });
 }
+
+test('keeps the announced avatars while fetching and after the author prop clears', () => {
+    const authors = [
+        { id: 'author', name: 'Demo author', avatar_url: null },
+    ] as User[];
+    const result = insertAt(500, false, authors);
+    const loaded = result.finish();
+
+    for (const nodes of [result.pending, result.fetching, loaded]) {
+        const previews = nodes.filter((node) => node.props.user !== undefined);
+        assert.equal(previews.length, 1);
+        assert.equal((previews[0].props.user as User).id, 'author');
+    }
+    assert.equal(
+        result.fetching.find((node) => node.type === 'button')?.props.disabled,
+        true,
+    );
+    assert.equal(
+        loaded.find((node) => node.type === 'button')?.props['aria-label'],
+        '3 new commits loaded. Scroll to top',
+    );
+});
