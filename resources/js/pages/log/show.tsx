@@ -476,7 +476,7 @@ export default function Show({
                             {preview.total > 5 && (
                                 <span
                                     title={`${preview.total - 5} more authors`}
-                                    className="relative grid size-6 shrink-0 place-items-center rounded-full bg-muted font-mono text-[10px] font-medium text-foreground tabular-nums ring-2 ring-primary"
+                                    className="relative grid size-6 shrink-0 place-items-center rounded-full bg-muted pt-0.5 font-mono text-[10px] leading-none font-medium text-foreground tabular-nums ring-2 ring-primary"
                                 >
                                     {preview.total - 5 > 99
                                         ? '99+'
@@ -489,16 +489,14 @@ export default function Show({
                                 aria-hidden
                                 className="invisible col-start-1 row-start-1"
                             >
-                                loaded · Scroll up
+                                committed
                             </span>
                             <span className="col-start-1 row-start-1 text-center">
                                 {isFetching
                                     ? 'fetching…'
                                     : newCommitsCount > 0
                                       ? 'committed'
-                                      : isAway
-                                        ? 'loaded · Scroll up'
-                                        : 'loaded'}
+                                      : 'loaded'}
                             </span>
                         </span>
                     </button>
