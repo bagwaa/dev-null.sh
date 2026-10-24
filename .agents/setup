@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+step() {
+    printf '\n==> %s\n' "$*"
+    time "$@"
+}
+
+# Debian's default PHP and PostgreSQL are older than this project's requirements.
+packages=(ca-certificates curl gnupg unzip php8.5-cli php8.5-curl php8.5-mbstring
+    php8.5-xml php8.5-zip php8.5-pgsql php8.5-gd php8.5-intl php8.5-bcmath
+    php8.5-pcov postgresql-18 postgresql-18-pgvector)
+missing=()
+for package in "${packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    sudo install -d /usr/share/keyrings
+    if [[ ! -f /etc/apt/sources.list.d/amp-php.list ]]; then
+        curl -fsSL https://packages.sury.org/php/apt.gpg | sudo tee /usr/share/keyrings/amp-php.gpg >/dev/null
+        echo 'deb [signed-by=/usr/share/keyrings/amp-php.gpg] https://packages.sury.org/php/ bookworm main' | sudo tee /etc/apt/sources.list.d/amp-php.list >/dev/null
+    fi
+    if [[ ! -f /etc/apt/sources.list.d/amp-postgresql.list ]]; then
+        curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor --yes -o /usr/share/keyrings/amp-postgresql.gpg
+        echo 'deb [signed-by=/usr/share/keyrings/amp-postgresql.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main' | sudo tee /etc/apt/sources.list.d/amp-postgresql.list >/dev/null
+    fi
+    step sudo apt-get update -qq
+    step sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+sudo update-alternatives --set php /usr/bin/php8.5
+echo -e 'zend.assertions=1\nmemory_limit=-1' | sudo tee /etc/php/8.5/cli/conf.d/99-orb.ini >/dev/null
+
+if ! command -v composer >/dev/null; then
+    installer=$(mktemp)
+    curl -fsSL https://getcomposer.org/installer -o "$installer"
+    expected=$(curl -fsSL https://composer.github.io/installer.sig)
+    [[ "$(sha384sum "$installer" | cut -d ' ' -f 1)" == "$expected" ]]
+    step php "$installer" --2 --install-dir=/usr/local/bin --filename=composer
+    rm "$installer"
+fi
+
+bun_version=$(node -p 'JSON.parse(require("fs").readFileSync("package.json")).devEngines.packageManager.version')
+if [[ "$(bun --version 2>/dev/null || true)" != "$bun_version" ]]; then
+    archive=$(mktemp --suffix=.zip)
+    curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${bun_version}/bun-linux-x64.zip" -o "$archive"
+    directory=$(mktemp -d)
+    unzip -q "$archive" -d "$directory"
+    sudo install -m 755 "$directory/bun-linux-x64/bun" /usr/local/bin/bun
+    rm -rf "$archive" "$directory"
+fi
+if [[ "$(node -p 'process.versions.node.split(".")[0]')" != 26 ]]; then
+    # Match the Node major used by .github/actions/setup.
+    step sudo npm install -g n
+    step sudo n 26
+fi
+
+[[ -f .env ]] || cp .env.example .env
+step composer install --no-interaction --prefer-dist --no-progress
+step bun install --frozen-lockfile
+if ! grep -Eq '^APP_KEY=.+$' .env; then
+    step php artisan key:generate --no-interaction
+fi
+step php artisan config:clear
+mkdir -p storage/framework/{cache/data,sessions,views} storage/logs
+if [[ ! -e public/storage && ! -L public/storage ]]; then
+    step php artisan storage:link
+fi
+
+# Only this disposable orb's loopback connections use trust authentication.
+# No application or user credentials are baked into the shared snapshot.
+if ! sudo grep -q '^# Amp orb loopback access$' /etc/postgresql/18/main/pg_hba.conf; then
+    sudo sed -i '1i# Amp orb loopback access\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust' /etc/postgresql/18/main/pg_hba.conf
+fi
+sudo tee /etc/postgresql/18/main/conf.d/orb.conf >/dev/null <<'EOF'
+listen_addresses = 'localhost'
+fsync = off
+synchronous_commit = off
+full_page_writes = off
+EOF
+started_database=false
+if ! sudo pg_ctlcluster 18 main status >/dev/null; then
+    step sudo pg_ctlcluster 18 main start
+    started_database=true
+fi
+cleanup() {
+    if "$started_database"; then
+        sudo pg_ctlcluster 18 main stop
+    fi
+}
+trap cleanup EXIT
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c "SELECT 'CREATE ROLE root LOGIN SUPERUSER' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'root')" -tA | sudo -u postgres psql -v ON_ERROR_STOP=1
+for database in devnull testing; do
+    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = '$database'" | grep -qx 1; then
+        step sudo -u postgres createdb -O root "$database"
+    fi
+done
+# Parallel tests clone template1, so they need the extensions there as well.
+for database in devnull testing template1; do
+    step sudo -u postgres psql -v ON_ERROR_STOP=1 -d "$database" -c 'CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm;'
+done
+step php artisan migrate --force --no-interaction
+step php artisan wayfinder:generate --with-form
+step bun run build
+printf '\nOrb setup ready: PHP %s, Bun %s, Node %s\n' "$(php -r 'echo PHP_VERSION;')" "$(bun --version)" "$(node --version)"

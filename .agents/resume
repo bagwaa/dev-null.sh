@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+# Restore writable runtime directories without reinstalling dependencies or
+# starting services (Amp supervises those through .amp/services.yaml).
+mkdir -p storage/framework/{cache/data,sessions,views} storage/logs
