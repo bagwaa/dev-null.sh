@@ -7,7 +7,7 @@ use App\Models\Commit;
 use App\Models\User;
 use App\Queries\LatestLogCommitsQuery;
 
-it('returns five distinct authors and counts additional authors rather than commits', function (): void {
+it('counts every newer commit while excluding the viewer', function (): void {
     $viewer = User::factory()->create();
     $seen = Commit::factory()->create(['created_at' => now()->subHour()]);
     $authors = User::factory()->count(7)->create();
@@ -16,13 +16,10 @@ it('returns five distinct authors and counts additional authors rather than comm
     });
 
     Commit::factory()->for($viewer)->create();
-    $result = resolve(LatestLogCommitsQuery::class)->authors(Log::Latest, $viewer, $seen);
-
-    expect($result['total'])->toBe(7)->and($result['users'])->toHaveCount(5);
-    expect($result['users']->pluck('id')->diff($authors->modelKeys()))->toBeEmpty();
+    expect(resolve(LatestLogCommitsQuery::class)->count(Log::Latest, $viewer, $seen))->toBe(14);
 });
 
-it('only shows followed authors in Following and none in Trending', function (): void {
+it('only counts followed authors in Following and none in Trending', function (): void {
     $viewer = User::factory()->create();
     $seen = Commit::factory()->create(['created_at' => now()->subHour()]);
     $followed = User::factory()->create();
@@ -30,10 +27,8 @@ it('only shows followed authors in Following and none in Trending', function ():
     Commit::factory()->for($followed)->create();
     Commit::factory()->create();
     $query = resolve(LatestLogCommitsQuery::class);
-    $result = $query->authors(Log::Following, $viewer, $seen);
-
-    expect($result['total'])->toBe(1)->and($result['users']->pluck('id')->all())->toBe([$followed->id]);
-    expect($query->authors(Log::Trending, $viewer, $seen)['total'])->toBe(0);
+    expect($query->count(Log::Following, $viewer, $seen))->toBe(1);
+    expect($query->count(Log::Trending, $viewer, $seen))->toBe(0);
 });
 
 it('excludes hidden authors replies and commits at or before the cursor', function (): void {
@@ -54,25 +49,18 @@ it('excludes hidden authors replies and commits at or before the cursor', functi
     Commit::factory()->create(['parent_id' => $seen->id]);
     Commit::factory()->create(['created_at' => now()->subHours(2)]);
     Commit::factory()->for($viewer)->create();
-    $visible = Commit::factory()->create();
+    Commit::factory()->create();
 
-    $result = resolve(LatestLogCommitsQuery::class)->authors(Log::Latest, $viewer, $seen);
-
-    expect($result['total'])->toBe(1)
-        ->and($result['users']->pluck('id')->all())->toBe([$visible->user_id]);
+    expect(resolve(LatestLogCommitsQuery::class)->count(Log::Latest, $viewer, $seen))->toBe(1);
 });
 
-it('previews public authors for guests and returns no authors when none are new', function (): void {
+it('counts public commits for guests and returns zero when none are new', function (): void {
     $seen = Commit::factory()->create(['created_at' => now()->subHour()]);
     $query = resolve(LatestLogCommitsQuery::class);
 
-    expect($query->authors(Log::Latest, null, $seen)['total'])->toBe(0)
-        ->and($query->authors(Log::Latest, null, $seen)['users'])->toBeEmpty();
+    expect($query->count(Log::Latest, null, $seen))->toBe(0);
 
     Commit::factory()->pending()->create();
-    $visible = Commit::factory()->create();
-    $result = $query->authors(Log::Latest, null, $seen);
-
-    expect($result['total'])->toBe(1)
-        ->and($result['users']->pluck('id')->all())->toBe([$visible->user_id]);
+    Commit::factory()->create();
+    expect($query->count(Log::Latest, null, $seen))->toBe(1);
 });

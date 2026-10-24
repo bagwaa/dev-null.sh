@@ -1,6 +1,13 @@
+import type { CancelToken } from '@inertiajs/core';
 import { Head, Link, router, usePage, usePoll } from '@inertiajs/react';
-import { ArrowUp, LoaderCircle } from 'lucide-react';
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { ArrowUp } from 'lucide-react';
+import {
+    useCallback,
+    useEffect,
+    useLayoutEffect,
+    useRef,
+    useState,
+} from 'react';
 import LogController from '@/actions/App/Http/Controllers/LogController';
 import { CommitComposer } from '@/components/commit-composer';
 import { useCommitDialogClosedCount } from '@/components/commit-composer-dialog';
@@ -24,42 +31,34 @@ export default function Show({
     log,
     commits,
     isRanked,
-    newCommitsCount = 0,
-    newCommitAuthors = { users: [], total: 0 },
     suggestions,
 }: {
     log: Log;
     commits: CursorPaginated<Commit>;
     isRanked: boolean;
-    newCommitsCount?: number;
-    newCommitAuthors?: { users: User[]; total: number };
     suggestions: Commit[];
 }) {
     const {
         props: { auth },
     } = usePage();
     const user = auth.user;
-    const autoLoads = log === 'latest';
-    const [isFetching, setIsFetching] = useState(false);
-    const [announced, setAnnounced] = useState(0);
-    const [announcedAuthors, setAnnouncedAuthors] = useState(newCommitAuthors);
-    const [loaded, setLoaded] = useState<'shown' | 'leaving' | null>(null);
-    const [isAway, setIsAway] = useState(false);
+    const [notice, setNotice] = useState<{
+        newestId: string;
+        users: User[];
+        total: number;
+        count: number;
+        leaving: boolean;
+    } | null>(null);
     const [stateLog, setStateLog] = useState(log);
-    const [waiting, setWaiting] = useState(0);
-    const loadedTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
-    const seenFresh = useRef<() => void>(() => undefined);
-    const fetchTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+    const noticeTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+    const loadRequest = useRef<CancelToken | null>(null);
     const loadingNew = useRef(false);
     const freshIds = useRef<Set<string>>(new Set());
 
     // Another log has its own commits to announce, so nothing of the last one's pill carries over.
     if (stateLog !== log) {
         setStateLog(log);
-        setIsFetching(false);
-        setLoaded(null);
-        setWaiting(0);
-        setAnnouncedAuthors({ users: [], total: 0 });
+        setNotice(null);
     }
 
     const commitDialogClosedCount = useCommitDialogClosedCount();
@@ -231,7 +230,6 @@ export default function Show({
                 if (visible.size > 0 && sightedAt === 0) {
                     sightedAt = Date.now();
                     timer = setTimeout(settle, 7000);
-                    seenFresh.current();
                 }
             },
             { threshold: 0.6 },
@@ -256,12 +254,67 @@ export default function Show({
 
     const firstSeenId = useLastVisit(viewerId, log, commits.data);
 
+    const loadNewest = (count: number) => {
+        if (isRanked || !count || loadingNew.current) {
+            return;
+        }
+
+        const known = new Set(commits.data.map((commit) => commit.id));
+        loadingNew.current = true;
+        router.reload(
+            backgroundPollOptions({
+                only: ['commits', 'newCommitsCount'],
+                reset: ['commits'],
+                data: { since: '' },
+                // Retain the loaded range so inserting new commits preserves the reader's row.
+                headers: { 'X-Log-Through': oldestLoadedId ?? '' },
+                preserveUrl: true,
+                onCancelToken: (token) => {
+                    loadRequest.current = token;
+                },
+                onSuccess: (page) => {
+                    const incoming = page.props
+                        .commits as CursorPaginated<Commit>;
+                    const arrivals = incoming.data.filter(
+                        (commit) =>
+                            !known.has(commit.id) &&
+                            commit.user_id !== user?.id,
+                    );
+                    if (window.scrollY <= 0 || arrivals.length === 0) return;
+
+                    const authors = [
+                        ...new Map(
+                            arrivals.map((commit) => [
+                                commit.user.id,
+                                commit.user,
+                            ]),
+                        ).values(),
+                    ];
+                    noticeTimers.current.forEach(clearTimeout);
+                    setNotice((current) => ({
+                        newestId: arrivals[0].id,
+                        users: authors.slice(0, 3),
+                        total: authors.length,
+                        count: (current?.count ?? 0) + arrivals.length,
+                        leaving: false,
+                    }));
+                },
+                onFinish: () => {
+                    loadingNew.current = false;
+                    loadRequest.current = null;
+                },
+            })(),
+        );
+    };
+
     const { stop: stopPolling } = usePoll(
         30_000,
         backgroundPollOptions(() => ({
-            only: ['newCommitsCount', 'newCommitAuthors'],
+            only: ['newCommitsCount'],
             data: { since: newestId },
             preserveUrl: true,
+            onSuccess: (page) =>
+                loadNewest(page.props.newCommitsCount as number),
         })),
         { autoStart: newestId !== undefined },
     );
@@ -281,114 +334,51 @@ export default function Show({
         [stopPolling],
     );
 
-    const reloadNewestFirst = () =>
-        router.reload({
-            only: ['commits', 'newCommitsCount', 'newCommitAuthors'],
-            reset: ['commits'],
-            data: { since: '' },
-            preserveUrl: true,
-            onSuccess: () => window.scrollTo({ top: 0, behavior: 'smooth' }),
-        });
+    const dismissNotice = useCallback(() => {
+        noticeTimers.current.forEach(clearTimeout);
+        setNotice((current) => current && { ...current, leaving: true });
+        noticeTimers.current = [setTimeout(() => setNotice(null), 450)];
+    }, []);
 
-    // The pill stays until the new commits have been seen, then lingers a moment and fades.
-    const dismissLoaded = (after: number) => {
-        loadedTimers.current.forEach(clearTimeout);
-        loadedTimers.current = [
-            setTimeout(() => setLoaded('leaving'), after),
-            setTimeout(() => {
-                setLoaded(null);
-                setWaiting(0);
-            }, after + 450),
-        ];
-    };
+    const noticeNewestId = notice?.newestId;
     useEffect(() => {
-        seenFresh.current = () => dismissLoaded(1500);
-    });
+        if (!noticeNewestId) return;
+        const row = Array.from(
+            feedRef.current?.querySelectorAll<HTMLElement>('[data-commit]') ??
+                [],
+        ).find((row) => row.dataset.commit === noticeNewestId);
+        if (!row) return;
+
+        const observer = new IntersectionObserver(
+            (entries) => {
+                if (entries.some((entry) => entry.isIntersecting))
+                    dismissNotice();
+            },
+            { threshold: 0.6 },
+        );
+        observer.observe(row);
+
+        return () => observer.disconnect();
+    }, [noticeNewestId, commits, dismissNotice]);
 
     useEffect(
         () => () => {
-            loadedTimers.current.forEach(clearTimeout);
-            clearTimeout(fetchTimer.current);
+            noticeTimers.current.forEach(clearTimeout);
+            loadRequest.current?.cancel();
         },
-        [],
+        [log],
     );
 
     useEffect(() => {
-        const update = () => setIsAway(window.scrollY > 120);
-        update();
+        const update = () => {
+            if (window.scrollY <= 0) dismissNotice();
+        };
         window.addEventListener('scroll', update, { passive: true });
 
         return () => window.removeEventListener('scroll', update);
-    }, []);
+    }, [dismissNotice]);
 
-    // Back at the top, the new commits are right there, so the pill has nothing left to ask for.
-    useEffect(() => {
-        if (!isAway && loaded === 'shown' && window.scrollY <= 0) {
-            seenFresh.current();
-        }
-    }, [isAway, loaded]);
-
-    // On Latest, new commits are fetched on their own, once the pill has had a moment to be read.
-    useEffect(() => {
-        if (!autoLoads || newCommitsCount === 0 || isFetching) {
-            return;
-        }
-
-        const timer = setTimeout(() => {
-            const count = newCommitsCount;
-            setAnnounced(count);
-            setAnnouncedAuthors(newCommitAuthors);
-            setIsFetching(true);
-            loadingNew.current = true;
-
-            // The pill says it is fetching for a beat, so it reads as a step even when the answer is quick.
-            fetchTimer.current = setTimeout(
-                () =>
-                    router.reload({
-                        only: [
-                            'commits',
-                            'newCommitsCount',
-                            'newCommitAuthors',
-                        ],
-                        reset: ['commits'],
-                        data: { since: '' },
-                        // The new commits come with everything already loaded, so the reader keeps their row.
-                        headers: {
-                            'X-Log-Through': oldestLoadedId ?? '',
-                        },
-                        preserveUrl: true,
-                        onFinish: () => {
-                            loadingNew.current = false;
-                            setIsFetching(false);
-                            setWaiting((total) => total + count);
-                            setLoaded('shown');
-                            loadedTimers.current.forEach(clearTimeout);
-                        },
-                    }),
-                700,
-            );
-        }, 1000);
-
-        return () => {
-            clearTimeout(timer);
-        };
-    }, [
-        autoLoads,
-        newCommitsCount,
-        newCommitAuthors,
-        isFetching,
-        oldestLoadedId,
-    ]);
-
-    const preview =
-        isFetching || newCommitsCount === 0
-            ? announcedAuthors
-            : newCommitAuthors;
-    const announcementLabel = isFetching
-        ? `Fetching ${announced} new ${announced === 1 ? 'commit' : 'commits'}`
-        : newCommitsCount > 0
-          ? `Show ${newCommitsCount} new ${newCommitsCount === 1 ? 'commit' : 'commits'}`
-          : `${waiting} new ${waiting === 1 ? 'commit' : 'commits'} loaded. Scroll to top`;
+    const announcementLabel = `${notice?.count ?? 0} new ${notice?.count === 1 ? 'commit' : 'commits'} above. Scroll to top`;
 
     return (
         <>
@@ -428,44 +418,29 @@ export default function Show({
                 </div>
             )}
 
-            {(newCommitsCount > 0 || isFetching || loaded !== null) && (
+            {notice !== null && (
                 <div
                     className="pointer-events-none sticky z-10 flex h-0 items-start justify-center"
                     style={{ top: tabsHeight }}
                 >
                     <button
                         type="button"
-                        onClick={
-                            newCommitsCount === 0 && loaded !== null
-                                ? () => {
-                                      window.scrollTo({
-                                          top: 0,
-                                          behavior: 'smooth',
-                                      });
-                                      dismissLoaded(900);
-                                  }
-                                : reloadNewestFirst
-                        }
-                        disabled={isFetching}
+                        onClick={() => {
+                            window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }}
                         aria-label={announcementLabel}
                         title={announcementLabel}
                         className={cn(
-                            loaded === 'leaving' &&
-                                newCommitsCount === 0 &&
-                                '-translate-y-2 opacity-0',
-                            'pointer-events-auto mt-3 flex min-h-11 max-w-[calc(100vw-2rem)] items-center gap-1.5 rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground shadow-[0_4px_14px_-4px_rgb(0_0_0/0.35)] transition-colors hover:bg-primary-hover motion-safe:animate-in motion-safe:transition-[opacity,translate,background-color] motion-safe:duration-450 motion-safe:fade-in motion-safe:slide-in-from-top-2',
+                            notice.leaving && '-translate-y-2 opacity-0',
+                            'pointer-events-auto mt-3 flex min-h-11 w-60 max-w-[calc(100vw-2rem)] items-center justify-center gap-1.5 rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground shadow-[0_4px_14px_-4px_rgb(0_0_0/0.35)] transition-colors hover:bg-primary-hover motion-safe:animate-in motion-safe:transition-[opacity,translate,background-color] motion-safe:duration-450 motion-safe:fade-in motion-safe:slide-in-from-top-2',
                         )}
                     >
-                        {isFetching ? (
-                            <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" />
-                        ) : (
-                            <ArrowUp className="size-4 shrink-0" />
-                        )}
+                        <ArrowUp className="size-4 shrink-0" />
                         <span
                             aria-hidden
                             className="flex shrink-0 items-center -space-x-1"
                         >
-                            {preview.users.map((author) => (
+                            {notice.users.map((author) => (
                                 <UserAvatar
                                     key={author.id}
                                     user={author}
@@ -473,32 +448,18 @@ export default function Show({
                                     className="size-6 ring-2 ring-primary"
                                 />
                             ))}
-                            {preview.total > 5 && (
+                            {notice.total > 3 && (
                                 <span
-                                    title={`${preview.total - 5} more authors`}
+                                    title={`${notice.total - 3} more authors`}
                                     className="relative grid size-6 shrink-0 place-items-center rounded-full bg-muted pt-0.5 font-mono text-[10px] leading-none font-medium text-foreground tabular-nums ring-2 ring-primary"
                                 >
-                                    {preview.total - 5 > 99
+                                    {notice.total - 3 > 99
                                         ? '99+'
-                                        : `+${preview.total - 5}`}
+                                        : `+${notice.total - 3}`}
                                 </span>
                             )}
                         </span>
-                        <span className="grid min-w-0">
-                            <span
-                                aria-hidden
-                                className="invisible col-start-1 row-start-1"
-                            >
-                                committed
-                            </span>
-                            <span className="col-start-1 row-start-1 text-center">
-                                {isFetching
-                                    ? 'fetching…'
-                                    : newCommitsCount > 0
-                                      ? 'committed'
-                                      : 'loaded'}
-                            </span>
-                        </span>
+                        <span className="min-w-0 truncate">New commits</span>
                     </button>
                 </div>
             )}

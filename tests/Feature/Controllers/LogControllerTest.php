@@ -782,7 +782,7 @@ it('rejects an invalid range boundary', function (): void {
         ->assertUnprocessable()->assertJsonValidationErrors('through');
 });
 
-it('returns distinct authors when polling for newer commits', function (): void {
+it('polls only the count while loaded commits provide their authors', function (): void {
     $viewer = User::factory()->create();
     $older = Commit::factory()->create(['created_at' => now()->subMinute()]);
     $author = User::factory()->create();
@@ -793,22 +793,19 @@ it('returns distinct authors when polling for newer commits', function (): void 
         'X-Inertia' => 'true',
         'X-Inertia-Version' => (string) resolve(HandleInertiaRequests::class)->version(request()),
         'X-Inertia-Partial-Component' => 'log/show',
-        'X-Inertia-Partial-Data' => 'newCommitsCount,newCommitAuthors',
+        'X-Inertia-Partial-Data' => 'newCommitsCount',
     ])->assertOk()
         ->assertJsonPath('props.newCommitsCount', 2)
-        ->assertJsonPath('props.newCommitAuthors.total', 1)
-        ->assertJsonCount(1, 'props.newCommitAuthors.users')
-        ->assertJsonPath('props.newCommitAuthors.users.0.id', $author->id);
+        ->assertJsonMissingPath('props.newCommitAuthors');
 });
 
-it('clears author previews when reloading without a since cursor', function (): void {
+it('resets the pending count when reloading without a since cursor', function (): void {
     $this->actingAs(User::factory()->create())->get(route('log.show', Log::Latest), [
         'X-Inertia' => 'true',
         'X-Inertia-Version' => (string) resolve(HandleInertiaRequests::class)->version(request()),
         'X-Inertia-Partial-Component' => 'log/show',
-        'X-Inertia-Partial-Data' => 'newCommitsCount,newCommitAuthors',
+        'X-Inertia-Partial-Data' => 'newCommitsCount',
     ])->assertOk()
         ->assertJsonPath('props.newCommitsCount', 0)
-        ->assertJsonPath('props.newCommitAuthors.total', 0)
-        ->assertJsonPath('props.newCommitAuthors.users', []);
+        ->assertJsonMissingPath('props.newCommitAuthors');
 });
