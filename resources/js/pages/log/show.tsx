@@ -1,4 +1,4 @@
-import type { CancelToken } from '@inertiajs/core';
+import type { CancelToken, PageProps } from '@inertiajs/core';
 import { Head, Link, router, usePage, usePoll } from '@inertiajs/react';
 import { ArrowUp } from 'lucide-react';
 import {
@@ -25,7 +25,7 @@ import AppLayout from '@/layouts/app-layout';
 import { backgroundPollOptions } from '@/lib/background-poll';
 import { emojify } from '@/lib/emoji';
 import { cn } from '@/lib/utils';
-import type { Commit, CursorPaginated, Log, User } from '@/types';
+import type { Commit, CursorPaginated, Log } from '@/types';
 
 export default function Show({
     log,
@@ -43,14 +43,10 @@ export default function Show({
     } = usePage();
     const user = auth.user;
     const [notice, setNotice] = useState<{
-        newestId: string;
-        users: User[];
-        total: number;
-        count: number;
+        commits: Commit[];
         leaving: boolean;
     } | null>(null);
     const [stateLog, setStateLog] = useState(log);
-    const noticeTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
     const loadRequest = useRef<CancelToken | null>(null);
     const loadingNew = useRef(false);
     const freshIds = useRef<Set<string>>(new Set());
@@ -90,6 +86,22 @@ export default function Show({
         return () => observer.disconnect();
     }, []);
 
+    const preserveReadingPosition = useCallback((ids: Set<string>) => {
+        const headerBottom =
+            tabsRef.current?.getBoundingClientRect().bottom ?? 0;
+        const rows =
+            feedRef.current?.querySelectorAll<HTMLElement>('[data-commit]') ??
+            [];
+        const row = Array.from(rows).find(
+            (row) =>
+                ids.has(row.dataset.commit ?? '') &&
+                row.getBoundingClientRect().bottom > headerBottom,
+        );
+        followAnchor.current = row
+            ? { row, top: row.getBoundingClientRect().top }
+            : null;
+    }, []);
+
     useEffect(
         () =>
             router.on('beforeUpdate', ({ detail: { page } }) => {
@@ -123,23 +135,11 @@ export default function Show({
                     }
                 }
 
-                const ids = new Set(incoming.data.map((commit) => commit.id));
-                const headerBottom =
-                    tabsRef.current?.getBoundingClientRect().bottom ?? 0;
-                const rows =
-                    feedRef.current?.querySelectorAll<HTMLElement>(
-                        '[data-commit]',
-                    ) ?? [];
-                const row = Array.from(rows).find(
-                    (row) =>
-                        ids.has(row.dataset.commit ?? '') &&
-                        row.getBoundingClientRect().bottom > headerBottom,
+                preserveReadingPosition(
+                    new Set(incoming.data.map((commit) => commit.id)),
                 );
-                followAnchor.current = row
-                    ? { row, top: row.getBoundingClientRect().top }
-                    : null;
             }),
-        [log, commits],
+        [log, commits, preserveReadingPosition],
     );
 
     useLayoutEffect(() => {
@@ -282,20 +282,18 @@ export default function Show({
                     );
                     if (window.scrollY <= 0 || arrivals.length === 0) return;
 
-                    const authors = [
-                        ...new Map(
-                            arrivals.map((commit) => [
-                                commit.user.id,
-                                commit.user,
-                            ]),
-                        ).values(),
-                    ];
-                    noticeTimers.current.forEach(clearTimeout);
                     setNotice((current) => ({
-                        newestId: arrivals[0].id,
-                        users: authors.slice(0, 3),
-                        total: authors.length,
-                        count: (current?.count ?? 0) + arrivals.length,
+                        commits: [
+                            ...arrivals,
+                            ...(current?.leaving
+                                ? []
+                                : (current?.commits ?? [])
+                            ).filter((commit) =>
+                                incoming.data.some(
+                                    (row) => row.id === commit.id,
+                                ),
+                            ),
+                        ],
                         leaving: false,
                     }));
                 },
@@ -310,11 +308,45 @@ export default function Show({
     const { stop: stopPolling } = usePoll(
         30_000,
         backgroundPollOptions(() => ({
-            only: ['newCommitsCount'],
-            data: { since: newestId },
+            only: ['newCommitsCount', 'removedCommitIds'],
+            data: {
+                since: newestId,
+                pending: notice?.leaving
+                    ? []
+                    : (notice?.commits.map((commit) => commit.id) ?? []),
+            },
             preserveUrl: true,
-            onSuccess: (page) =>
-                loadNewest(page.props.newCommitsCount as number),
+            onSuccess: (page) => {
+                const removed = new Set(
+                    page.props.removedCommitIds as string[],
+                );
+                if (removed.size > 0) {
+                    setNotice((current) => {
+                        if (!current || current.leaving) return current;
+                        const remaining = current.commits.filter(
+                            (commit) => !removed.has(commit.id),
+                        );
+                        return remaining.length > 0
+                            ? { ...current, commits: remaining }
+                            : { ...current, leaving: true };
+                    });
+                    router.replaceProp(
+                        'commits',
+                        (value: unknown, props: PageProps) => {
+                            if (props.log !== log) return value;
+                            const current = value as CursorPaginated<Commit>;
+                            const retained = current.data.filter(
+                                (commit) => !removed.has(commit.id),
+                            );
+                            preserveReadingPosition(
+                                new Set(retained.map((commit) => commit.id)),
+                            );
+                            return { ...current, data: retained };
+                        },
+                    );
+                }
+                loadNewest(page.props.newCommitsCount as number);
+            },
         })),
         { autoStart: newestId !== undefined },
     );
@@ -335,12 +367,17 @@ export default function Show({
     );
 
     const dismissNotice = useCallback(() => {
-        noticeTimers.current.forEach(clearTimeout);
         setNotice((current) => current && { ...current, leaving: true });
-        noticeTimers.current = [setTimeout(() => setNotice(null), 450)];
     }, []);
 
-    const noticeNewestId = notice?.newestId;
+    const noticeLeaving = notice?.leaving;
+    useEffect(() => {
+        if (!noticeLeaving) return;
+        const timer = setTimeout(() => setNotice(null), 450);
+        return () => clearTimeout(timer);
+    }, [noticeLeaving]);
+
+    const noticeNewestId = notice?.commits[0]?.id;
     useEffect(() => {
         if (!noticeNewestId) return;
         const row = Array.from(
@@ -363,7 +400,6 @@ export default function Show({
 
     useEffect(
         () => () => {
-            noticeTimers.current.forEach(clearTimeout);
             loadRequest.current?.cancel();
         },
         [log],
@@ -378,7 +414,12 @@ export default function Show({
         return () => window.removeEventListener('scroll', update);
     }, [dismissNotice]);
 
-    const announcementLabel = `${notice?.count ?? 0} new ${notice?.count === 1 ? 'commit' : 'commits'} above. Scroll to top`;
+    const authors = [
+        ...new Map(
+            notice?.commits.map((commit) => [commit.user.id, commit.user]),
+        ).values(),
+    ];
+    const announcementLabel = `${notice?.commits.length ?? 0} new ${notice?.commits.length === 1 ? 'commit' : 'commits'} above. Scroll to top`;
 
     return (
         <>
@@ -438,24 +479,28 @@ export default function Show({
                         <ArrowUp className="size-4 shrink-0" />
                         <span
                             aria-hidden
-                            className="flex shrink-0 items-center -space-x-1"
+                            className="grid w-21 shrink-0 grid-cols-[repeat(3,20px)_24px] items-center"
                         >
-                            {notice.users.map((author) => (
-                                <UserAvatar
-                                    key={author.id}
-                                    user={author}
-                                    pixels={48}
-                                    className="size-6 ring-2 ring-primary"
-                                />
+                            {[0, 1, 2].map((slot) => (
+                                <span key={slot}>
+                                    {authors[slot] && (
+                                        <UserAvatar
+                                            key={authors[slot].id}
+                                            user={authors[slot]}
+                                            pixels={48}
+                                            className="size-6 ring-2 ring-primary"
+                                        />
+                                    )}
+                                </span>
                             ))}
-                            {notice.total > 3 && (
+                            {authors.length > 3 && (
                                 <span
-                                    title={`${notice.total - 3} more authors`}
+                                    title={`${authors.length - 3} more authors`}
                                     className="relative grid size-6 shrink-0 place-items-center rounded-full bg-muted pt-0.5 font-mono text-[10px] leading-none font-medium text-foreground tabular-nums ring-2 ring-primary"
                                 >
-                                    {notice.total - 3 > 99
+                                    {authors.length - 3 > 99
                                         ? '99+'
-                                        : `+${notice.total - 3}`}
+                                        : `+${authors.length - 3}`}
                                 </span>
                             )}
                         </span>

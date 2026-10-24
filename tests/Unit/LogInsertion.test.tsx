@@ -18,6 +18,7 @@ const listeners = new Map<string, (event: unknown) => void>();
 let viewer: User | null = null;
 const reload = vi.fn();
 let pollOptions: () => ReloadOptions;
+let replaceCommits: (value: (old: unknown, props: unknown) => unknown) => void;
 vi.doMock('react', () => ({
     ...React,
     useRef: (initial: unknown) => (slots[cursor++] ??= { current: initial }),
@@ -87,6 +88,10 @@ vi.doMock('@inertiajs/react', () => ({
             return () => listeners.delete(name);
         },
         reload,
+        replaceProp: (
+            _name: string,
+            value: (old: unknown, props: unknown) => unknown,
+        ) => replaceCommits(value),
         flushAll: vi.fn(),
     },
 }));
@@ -237,9 +242,9 @@ function insertAt(
     };
     const previous = commits(['existing']);
     const pending = render(previous);
-    const poll = () =>
+    const poll = (count = total, removedCommitIds: string[] = []) =>
         pollOptions().onSuccess!({
-            props: { newCommitsCount: total },
+            props: { newCommitsCount: count, removedCommitIds },
         } as never);
     poll();
     const fetching = render(previous);
@@ -267,6 +272,18 @@ function insertAt(
     rows = [...fresh, existing];
     render(incoming);
     let current = incoming;
+    replaceCommits = (value) => {
+        const next = value(current, { log }) as CursorPaginated<Commit>;
+        const removed = current.data.length - next.data.length;
+        rows = rows.filter((row) =>
+            next.data.some(
+                (c) => c.id === (row as typeof existing).dataset.commit,
+            ),
+        );
+        rowPosition -= removed * 120;
+        current = next;
+        render(current);
+    };
     const finish = (success = true, delivered = incoming) => {
         const request = reload.mock.calls.at(-1)![0];
         if (success) request.onSuccess?.({ props: { commits: delivered } });
@@ -275,6 +292,9 @@ function insertAt(
     };
     return {
         incoming,
+        data: () => current.data,
+        request: () => pollOptions(),
+        readingTop: () => existing.getBoundingClientRect().top,
         render: () => render(current),
         paginate: () => {
             current = {
@@ -286,6 +306,7 @@ function insertAt(
         scrollTo: (top: number) => {
             scrollY = top;
             scrollListeners.forEach((listener) => listener());
+            render(current);
         },
         sight: (index: number) => {
             for (const observer of intersections) {
@@ -297,6 +318,7 @@ function insertAt(
                         { target: fresh[index], isIntersecting: true },
                     ]);
             }
+            render(current);
         },
         poll,
         pending,
@@ -524,4 +546,104 @@ test('keeps notice dismissal active after highlights settle and pagination appen
         result.render().some((node) => node.type === 'button'),
         false,
     );
+});
+
+for (const log of ['following', 'latest'] as const) {
+    test(`reconciles deleted announcements without new arrivals in ${log}`, () => {
+        const authors = Array.from({ length: 4 }, (_, i) => ({
+            id: `author-${i}`,
+            name: `Author ${i}`,
+            avatar_url: null,
+        })) as User[];
+        const result = insertAt(500, false, authors, log, 4);
+        result.finish();
+        const requests = reload.mock.calls.length;
+        assert.deepEqual(
+            (result.request().data as { pending: string[] }).pending,
+            ['new-0', 'new-1', 'new-2', 'new-3'],
+        );
+        const top = result.readingTop();
+        result.poll(0, ['new-0']);
+        assert.equal(result.readingTop(), top);
+        const nodes = result.render();
+        assert.equal(
+            nodes.find((n) => n.type === 'button')!.props['aria-label'],
+            '3 new commits above. Scroll to top',
+        );
+        assert.deepEqual(
+            nodes
+                .filter((n) => n.props.user)
+                .map((n) => (n.props.user as User).id),
+            ['author-1', 'author-2', 'author-3'],
+        );
+        assert.equal(
+            result.data().some((c) => c.id === 'new-0'),
+            false,
+        );
+        assert.equal(reload.mock.calls.length, requests);
+        result.sight(1);
+        vi.advanceTimersByTime(450);
+        assert.equal(
+            result.render().some((n) => n.type === 'button'),
+            false,
+        );
+    });
+    test(`fades out after all pending commits are deleted in ${log}`, () => {
+        const result = insertAt(500, false, [], log);
+        const before = result.finish();
+        result.poll(0, ['new-0', 'new-1', 'new-2']);
+        const fading = result.render();
+        assert.match(
+            fading.find((n) => n.type === 'button')!.props.className as string,
+            /opacity-0/,
+        );
+        assert.equal(
+            fading.filter((n) => n.props.user).length,
+            before.filter((n) => n.props.user).length,
+        );
+        vi.advanceTimersByTime(450);
+        assert.equal(
+            result.render().some((n) => n.type === 'button'),
+            false,
+        );
+        assert.deepEqual(
+            result.data().map((c) => c.id),
+            ['existing'],
+        );
+    });
+}
+
+test('reconciles removals and new arrivals in the same polling cycle', () => {
+    const result = insertAt(500);
+    result.finish();
+    result.poll(2, ['new-0']);
+    const request = reload.mock.calls.at(-1)![0];
+    const delivered = {
+        data: [
+            {
+                id: 'next-0',
+                user_id: 'next-author',
+                user: { id: 'next-author' },
+            },
+            {
+                id: 'next-1',
+                user_id: 'next-author',
+                user: { id: 'next-author' },
+            },
+            ...result.data(),
+        ],
+    } as CursorPaginated<Commit>;
+    request.onSuccess({ props: { commits: delivered } });
+    request.onFinish();
+    const button = result.render().find((n) => n.type === 'button')!;
+    assert.equal(
+        button.props['aria-label'],
+        '4 new commits above. Scroll to top',
+    );
+    assert.deepEqual((result.request().data as { pending: string[] }).pending, [
+        'next-0',
+        'next-1',
+        'new-1',
+        'new-2',
+    ]);
 });

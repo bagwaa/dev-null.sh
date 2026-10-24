@@ -809,3 +809,30 @@ it('resets the pending count when reloading without a since cursor', function ()
         ->assertJsonPath('props.newCommitsCount', 0)
         ->assertJsonMissingPath('props.newCommitAuthors');
 });
+
+it('reconciles pending arrivals even when no newer commits exist', function (Log $log): void {
+    $viewer = User::factory()->create();
+    $author = User::factory()->create();
+    $viewer->following()->attach($author);
+    $pending = Commit::factory()->for($author)->count(4)->create();
+    $pending[0]->delete();
+    $response = $this->actingAs($viewer)->get(route('log.show', [
+        $log, 'since' => $pending[3]->id, 'pending' => $pending->modelKeys(),
+    ]), [
+        'X-Inertia' => 'true',
+        'X-Inertia-Version' => (string) resolve(HandleInertiaRequests::class)->version(request()),
+        'X-Inertia-Partial-Component' => 'log/show',
+        'X-Inertia-Partial-Data' => 'newCommitsCount,removedCommitIds',
+    ]);
+    $response->assertOk()->assertJsonPath('props.newCommitsCount', 0)
+        ->assertJsonPath('props.removedCommitIds', [$pending[0]->id])
+        ->assertJsonMissingPath('props.commits');
+})->with([Log::Following, Log::Latest]);
+
+it('rejects malformed pending commit identifiers', function (array $pending, string $field): void {
+    $this->actingAs(User::factory()->create())->getJson(route('log.show', [Log::Latest, ...$pending]))
+        ->assertUnprocessable()->assertJsonValidationErrors($field);
+})->with([
+    [['pending' => 'bad'], 'pending'],
+    [['pending' => ['bad']], 'pending.0'],
+]);

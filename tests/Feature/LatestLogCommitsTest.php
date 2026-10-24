@@ -64,3 +64,25 @@ it('counts public commits for guests and returns zero when none are new', functi
     Commit::factory()->create();
     expect($query->count(Log::Latest, null, $seen))->toBe(1);
 });
+
+it('returns only requested identifiers no longer visible in the log', function (): void {
+    $viewer = User::factory()->create();
+    $followed = User::factory()->create();
+    $viewer->following()->attach($followed);
+    $visible = Commit::factory()->for($followed)->create();
+    $deleted = Commit::factory()->for($followed)->create();
+    $deleted->delete();
+
+    $stranger = Commit::factory()->create();
+    $muted = User::factory()->create();
+    $viewer->muting()->attach($muted);
+    $hidden = Commit::factory()->for($muted)->create();
+    $reply = Commit::factory()->for($followed)->create(['parent_id' => $visible->id]);
+    $query = resolve(LatestLogCommitsQuery::class);
+    $ids = [$visible->id, $deleted->id, $stranger->id, $hidden->id, $reply->id];
+    expect($query->missing(Log::Latest, $viewer, $ids))->toBe([$deleted->id, $hidden->id, $reply->id]);
+    expect($query->missing(Log::Following, $viewer, $ids))->toBe([$deleted->id, $stranger->id, $hidden->id, $reply->id]);
+    expect($query->missing(Log::Latest, null, [$visible->id, $deleted->id]))->toBe([$deleted->id]);
+    expect($query->missing(Log::Latest, $viewer, []))->toBe([]);
+    expect($query->missing(Log::Trending, $viewer, $ids))->toBe([]);
+});
