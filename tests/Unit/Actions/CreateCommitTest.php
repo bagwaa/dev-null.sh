@@ -7,6 +7,9 @@ use App\Dto\NewPoll;
 use App\Enums\CommitStatus;
 use App\Enums\NotificationType;
 use App\Enums\PollDuration;
+use App\Exceptions\CommitProcessingFailed;
+use App\Jobs\CheckUserLevel;
+use App\Jobs\ClassifyCommitTopics;
 use App\Jobs\EmbedCommit;
 use App\Jobs\ModerateCommit;
 use App\Jobs\UnfurlLink;
@@ -18,6 +21,10 @@ use App\Models\User;
 use App\Services\TheAlgorithm;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Exceptions;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 
@@ -187,6 +194,61 @@ it('asks the ai for its decision on pending commits', function (): void {
     $commit = $action->handle(User::factory()->create(), 'Initial commit');
 
     Queue::assertPushed(ModerateCommit::class, fn (ModerateCommit $job): bool => $job->commit->is($commit));
+});
+
+it('queues topic classification after creation for roots and quotes but not replies or empty posts', function (): void {
+    config(['ai.providers.openai.key' => 'sk-test']);
+    Queue::fake();
+    $user = User::factory()->create();
+    $action = resolve(CreateCommit::class);
+
+    $root = $action->handle($user, 'Will PHP 8.6 ship this November?');
+    $quote = $action->handle($user, 'PHP releases are worth discussing', quotedCommit: $root);
+    $action->handle($user, 'I think so', parent: $root);
+    $action->handle($user, '');
+
+    Queue::assertPushed(ClassifyCommitTopics::class, 2);
+    Queue::assertPushed(ClassifyCommitTopics::class, fn (ClassifyCommitTopics $job): bool => $job->commitIds === [$root->id] && $job->afterCommit === true);
+    Queue::assertPushed(ClassifyCommitTopics::class, fn (ClassifyCommitTopics $job): bool => $job->commitIds === [$quote->id]);
+});
+
+it('does not queue topic classification without a provider key', function (): void {
+    config(['ai.providers.openai.key' => null]);
+    Queue::fake();
+
+    resolve(CreateCommit::class)->handle(User::factory()->create(), 'Will PHP 8.6 ship this November?');
+
+    Queue::assertNotPushed(ClassifyCommitTopics::class);
+});
+
+it('creates the commit before classification and keeps failed low priority jobs free of provider content', function (): void {
+    config(['queue.default' => 'database', 'ai.providers.openai.key' => 'sk-test', 'app.admins' => ['topic-author']]);
+    Bus::fake([CheckUserLevel::class]);
+    Exceptions::fake();
+    Http::fake(['api.openai.com/v1/decisions' => Http::response(['error' => ['message' => 'Sensitive provider response']], 400)]);
+
+    $commit = resolve(CreateCommit::class)->handle(User::factory()->create(['username' => 'topic-author']), 'Will PHP 8.6 ship this November?');
+
+    $this->assertModelExists($commit);
+    $this->assertDatabaseHas('jobs', ['queue' => 'low']);
+    Http::assertNothingSent();
+
+    $this->artisan('queue:work', ['connection' => 'database', '--queue' => 'default', '--once' => true])->assertSuccessful();
+    Http::assertNothingSent();
+
+    foreach ([0, 60, 600] as $delay) {
+        $this->travel($delay)->seconds();
+        $this->artisan('queue:work', ['connection' => 'database', '--queue' => 'default,low', '--once' => true])->assertSuccessful();
+    }
+
+    expect($commit->refresh())->topic_decision->toBeNull()->status->toBe(CommitStatus::Approved);
+    $this->assertDatabaseCount('jobs', 0);
+    $this->assertDatabaseCount('failed_jobs', 1);
+    expect(DB::table('failed_jobs')->value('exception'))
+        ->toContain('Topic classification failed for commit '.$commit->id)
+        ->not->toContain('Sensitive provider response', $commit->body);
+    Exceptions::assertReported(fn (CommitProcessingFailed $exception): bool => ! $exception->getPrevious() instanceof Throwable
+        && ! str_contains($exception->getMessage(), 'Sensitive provider response'));
 });
 
 it('does not ask the ai about commits of admins', function (): void {
